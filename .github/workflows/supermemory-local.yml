@@ -1,0 +1,125 @@
+name: supermemory-local
+
+# Runs Supermemory Local against single LongMemEval-S questions on free GitHub-hosted runners,
+# reproducing the M2 configuration of the agent-memory-store comparison
+# (codeberg.org/manojpardeshi/agent-memory-store, evaluation/memorybench/
+# supermemory-local-comparison-v1.json). Everything is pinned and local to the runner: the
+# extraction model runs in Ollama on the runner's CPU, embeddings run inside Supermemory, and no
+# hosted model or paid API is called. One question per job; results are uploaded as artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_prefix:
+        description: "Run id prefix"
+        default: "supermemory-local-strat30-cloud"
+
+permissions:
+  contents: read
+
+env:
+  MEMORYBENCH_REPO: https://github.com/supermemoryai/memorybench.git
+  MEMORYBENCH_COMMIT: 118209a746d97d0d85e5a7234267f0b6962857e9
+  BUN_VERSION: 1.4.2
+  OLLAMA_VERSION: 0.32.1
+  MODEL: qwen2.5:7b
+  MODEL_DIGEST: 845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e
+  SUPERMEMORY_CLI: supermemory@5.0.1
+  SUPERMEMORY_SERVER_VERSION: 0.0.8
+  SUPERMEMORY_SERVER_SHA256_LINUX_X64: 87f32433d0179be80bb9d8a1bafbac65af4128324342a27ecb8bd1a77b5506f3
+  DATASET_URL: https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+  DATASET_SHA256: d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442
+
+jobs:
+  question:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        qid: [c7dc5443, a2f3aa27, 08e075c7, ce6d2d27, 0ddfec37, 89527b6b, 51b23612, 4baee567, 6222b6eb, 18dcd5a5]
+    env:
+      RUN_ID: ${{ inputs.run_prefix }}-${{ matrix.qid }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Record runner hardware
+        run: |
+          nproc; free -g; lscpu | grep -E "Model name|Flags" | cut -c1-120
+
+      - name: Install Ollama and the pinned model (16k context, temperature 0)
+        run: |
+          curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION="$OLLAMA_VERSION" sh
+          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 2; done
+          ollama pull "$MODEL"
+          digest="$(curl -s http://127.0.0.1:11434/api/tags | python3 -c "import json,sys; print(next(m['digest'] for m in json.load(sys.stdin)['models'] if m['name']=='$MODEL'))")"
+          [ "$digest" = "$MODEL_DIGEST" ] || { echo "model digest $digest does not match the M2's"; exit 1; }
+          printf 'FROM %s\nPARAMETER num_ctx 16384\nPARAMETER temperature 0\n' "$MODEL" > Modelfile
+          ollama create qwen2.5-7b-16k -f Modelfile
+
+      - name: Build the pinned MemoryBench harness
+        run: |
+          git clone -q "$MEMORYBENCH_REPO" memorybench
+          cd memorybench
+          git checkout -q "$MEMORYBENCH_COMMIT"
+          git apply ../patches/memorybench-local.patch
+          mkdir -p src/providers/llm-memory-store scripts manifests
+          cp ../patches/llm-memory-store-provider/index.ts src/providers/llm-memory-store/
+          cp ../scripts/hosted-search-manifest.ts scripts/
+          printf '{"question_ids": ["%s"]}\n' "${{ matrix.qid }}" > manifests/question.json
+          bun install --frozen-lockfile
+
+      - name: Fetch and verify the dataset
+        run: |
+          mkdir -p memorybench/data/benchmarks/longmemeval/datasets
+          curl -fsSL "$DATASET_URL" -o memorybench/data/benchmarks/longmemeval/datasets/longmemeval_s_cleaned.json
+          echo "$DATASET_SHA256  memorybench/data/benchmarks/longmemeval/datasets/longmemeval_s_cleaned.json" | sha256sum -c -
+
+      - name: Install and verify Supermemory Local
+        run: |
+          bunx "$SUPERMEMORY_CLI" local install --version "$SUPERMEMORY_SERVER_VERSION" </dev/null
+          echo "$SUPERMEMORY_SERVER_SHA256_LINUX_X64  $HOME/.supermemory/bin/supermemory-server" | sha256sum -c -
+
+      - name: Start Supermemory Local against Ollama
+        run: |
+          mkdir -p "$RUNNER_TEMP/sm"
+          SUPERMEMORY_DATA_DIR="$RUNNER_TEMP/sm/data" \
+          SUPERMEMORY_HOST=127.0.0.1 \
+          SUPERMEMORY_DISABLE_TELEMETRY=1 \
+          OPENAI_BASE_URL=http://127.0.0.1:11434/v1 \
+          OPENAI_API_KEY=ollama \
+          OPENAI_MODEL=qwen2.5-7b-16k \
+            nohup "$HOME/.supermemory/bin/supermemory-server" > "$RUNNER_TEMP/sm/server.log" 2>&1 &
+          for _ in $(seq 1 120); do curl -s -o /dev/null http://127.0.0.1:6767/ && break; sleep 2; done
+          curl -s -o /dev/null http://127.0.0.1:6767/ || { cat "$RUNNER_TEMP/sm/server.log"; exit 1; }
+          test -s "$RUNNER_TEMP/sm/data/api-key"
+
+      - name: Ingest, index, and search one question
+        working-directory: memorybench
+        run: |
+          export SUPERMEMORY_BASE_URL=http://127.0.0.1:6767
+          SUPERMEMORY_API_KEY="$(head -1 "$RUNNER_TEMP/sm/data/api-key")"
+          export SUPERMEMORY_API_KEY
+          echo "::add-mask::$SUPERMEMORY_API_KEY"
+          start=$(date +%s)
+          bun scripts/hosted-search-manifest.ts supermemory "$RUN_ID" manifests/question.json 1
+          echo "{\"qid\": \"${{ matrix.qid }}\", \"seconds\": $(( $(date +%s) - start )), \"runner\": \"github-ubuntu-24.04-cpu\"}" > "data/runs/$RUN_ID/timing.json"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p out
+          cp -r "memorybench/data/runs/$RUN_ID" out/ 2>/dev/null || true
+          sed -E 's/sm_[A-Za-z0-9_-]+/sm_<redacted>/g' "$RUNNER_TEMP/sm/server.log" > out/server.log 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.RUN_ID }}
+          path: out/
+          retention-days: 30
