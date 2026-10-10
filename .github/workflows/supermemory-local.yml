@@ -13,6 +13,9 @@ on:
       run_prefix:
         description: "Run id prefix"
         default: "supermemory-local-strat30-cloud"
+      questions:
+        description: "JSON list of question ids (default: the ten cloud questions of cloud-split-v1)"
+        default: '["c7dc5443", "a2f3aa27", "08e075c7", "ce6d2d27", "0ddfec37", "89527b6b", "51b23612", "4baee567", "6222b6eb", "18dcd5a5"]'
 
 permissions:
   contents: read
@@ -38,7 +41,7 @@ jobs:
       fail-fast: false
       max-parallel: 10
       matrix:
-        qid: [c7dc5443, a2f3aa27, 08e075c7, ce6d2d27, 0ddfec37, 89527b6b, 51b23612, 4baee567, 6222b6eb, 18dcd5a5]
+        qid: ${{ fromJSON(inputs.questions) }}
     env:
       RUN_ID: ${{ inputs.run_prefix }}-${{ matrix.qid }}
     steps:
@@ -55,7 +58,14 @@ jobs:
       - name: Install Ollama and the pinned model (16k context, temperature 0)
         run: |
           curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION="$OLLAMA_VERSION" sh
-          for _ in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 2; done
+          # The installer's systemd service sometimes is not answering yet; start a server
+          # directly if it is not up, then wait for either.
+          for _ in $(seq 1 15); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 2; done
+          if ! curl -sf http://127.0.0.1:11434/api/version; then
+            nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          fi
+          for _ in $(seq 1 90); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 2; done
+          curl -sf http://127.0.0.1:11434/api/version || { cat "$RUNNER_TEMP/ollama.log" 2>/dev/null; exit 1; }
           ollama pull "$MODEL"
           digest="$(curl -s http://127.0.0.1:11434/api/tags | python3 -c "import json,sys; print(next(m['digest'] for m in json.load(sys.stdin)['models'] if m['name']=='$MODEL'))")"
           [ "$digest" = "$MODEL_DIGEST" ] || { echo "model digest $digest does not match the M2's"; exit 1; }
