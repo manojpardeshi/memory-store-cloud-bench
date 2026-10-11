@@ -29,3 +29,13 @@ main repository: `evaluation/memorybench/supermemory-local-comparison-v1.json`.
 
 These are retrieval runs of Supermemory Local under a small free local model. They say nothing
 about Supermemory's hosted service, which uses different models.
+
+## Outcome of the first runs (2026-10-10/11): not usable
+
+All ten questions ran on `ubuntu-24.04` CPU runners. Three hit the six-hour job limit. The seven
+that "succeeded" are invalid: on the runner CPU, `qwen2.5:7b` was too slow for Supermemory Local's
+internal memory-agent timeouts. The server logged "memory agent failed … skipping memory
+generation" and marked nearly every session failed (0–1 of 45–51 sessions indexed per question).
+These runs are therefore not Supermemory results, and the main comparison uses none of them. Per
+the split, every cloud question falls back to the M2 run. Free CPU runners are not viable for this
+workload; a GPU or a much smaller model would be needed.
